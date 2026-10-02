@@ -1,0 +1,117 @@
+name: audiowaveform
+title: audiowaveform
+summary: Generates waveform data and PNG images from MP3, WAV, FLAC, Ogg Vorbis and Opus audio, in the binary and JSON formats that Peaks.js reads.
+homepage: https://codeberg.org/chrisn/audiowaveform
+# audiowaveform, and what it compiles in from its source tree: code adapted
+# from madlld in the MP3 reader and madlld's bstdfile.c (BSD-3-Clause), and
+# the pdjson JSON parser (Unlicense).
+license: GPL-3.0-or-later AND BSD-3-Clause AND Unlicense
+source-release: true
+upstream:
+  source: forgejo-tag
+  server: https://codeberg.org
+  repository: chrisn/audiowaveform
+  # Release tags look like 1.11.1. The pattern skips aws-static-1.10.1,
+  # which marks a packaging build.
+  tag-pattern: '^(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 1.11.1
+  # No release tarball is published, so the build clones the tag. The tags
+  # are lightweight, and the build checks the signature on the commit.
+  git:
+    url: https://codeberg.org/chrisn/audiowaveform.git
+    tag: '{version}'
+    commit: 1b1064f8437c6ea0507fb3dd8dcaa2cbce4f272c
+image:
+  entrypoint: [audiowaveform]
+  cmd: [--help]
+test:
+  - |
+    audiowaveform --version > version.txt
+    test "$(cat version.txt)" = "AudioWaveform v$VERSION" || { cat version.txt >&2; exit 1; }
+  - |
+    # One second of 8 kHz 16-bit mono audio read through libsndfile. Every
+    # sample is 0x4040, so each 8-bit point is 64.
+    {
+      printf 'RIFF\244\076\000\000WAVEfmt \020\000\000\000\001\000\001\000'
+      printf '\100\037\000\000\200\076\000\000\002\000\020\000data\200\076\000\000'
+      head -c 16000 /dev/zero | tr '\000' '\100'
+    } > tone.wav
+    audiowaveform -q -i tone.wav -o tone.json -z 100 -b 8
+    {
+      printf '{"version":2,"channels":1,"sample_rate":8000,"samples_per_pixel":100,"bits":8,"length":80,"data":[64'
+      i=1
+      while [ "$i" -lt 160 ]; do printf ',64'; i=$((i + 1)); done
+      printf ']}\n'
+    } > expected.json
+    cmp tone.json expected.json || { cat tone.json >&2; exit 1; }
+    # The binary format, version 1 for one channel: version, flags (8-bit),
+    # sample rate, samples per pixel and length, then a minimum and a
+    # maximum byte for each point.
+    audiowaveform -q -i tone.wav -o tone.dat -z 100 -b 8
+    {
+      printf '\001\000\000\000\001\000\000\000\100\037\000\000\144\000\000\000\120\000\000\000'
+      head -c 160 /dev/zero | tr '\000' '\100'
+    } > expected.dat
+    cmp tone.dat expected.dat || { od -An -tx1 tone.dat >&2; exit 1; }
+    # The PNG signature and an IHDR chunk for 200 x 50 pixels.
+    audiowaveform -q -i tone.wav -o tone.png -w 200 -h 50
+    printf '\211PNG\r\n\032\n\000\000\000\015IHDR\000\000\000\310\000\000\000\062' > expected-png.bin
+    head -c 24 tone.png > png.bin
+    cmp png.bin expected-png.bin || { od -An -tx1 png.bin >&2; exit 1; }
+  - |
+    # 40 silent MPEG-1 Layer III frames, 44.1 kHz mono at 128 kbit/s, decoded
+    # by libmad into 40 x 1152 samples.
+    frames() {
+      i=0
+      while [ "$i" -lt 40 ]; do printf '\377\373\220\300'; head -c 413 /dev/zero; i=$((i + 1)); done
+    }
+    frames > silence.mp3
+    audiowaveform -q -i silence.mp3 -o mp3.json -z 1152 -b 8
+    expected='{"version":2,"channels":1,"sample_rate":44100,"samples_per_pixel":1152,"bits":8,"length":40,"data":['
+    grep -Fq "$expected" mp3.json || { cat mp3.json >&2; exit 1; }
+    # Audio on stdin needs --input-format; the output goes to stdout.
+    frames | audiowaveform -q --input-format mp3 --output-format json -z 1152 -b 8 > stdin.json
+    cmp mp3.json stdin.json || { cat stdin.json >&2; exit 1; }
+  - |
+    # Raw audio has no header, so the sample rate, channels and sample format
+    # are given on the command line. 1600 bytes of 16-bit silence at 8 kHz
+    # are 800 samples, 8 points of 100.
+    head -c 1600 /dev/zero \
+      | audiowaveform -q --input-format raw --raw-samplerate 8000 --raw-channels 1 --raw-format s16le \
+        --output-format json -z 100 -b 8 > raw.json
+    printf '{"version":2,"channels":1,"sample_rate":8000,"samples_per_pixel":100,"bits":8,"length":8,"data":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}\n' > expected-raw.json
+    cmp raw.json expected-raw.json || { cat raw.json >&2; exit 1; }
+examples:
+  - title: Write waveform data for Peaks.js to input.dat
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/audiowaveform -i input.mp3 -o input.dat -z 256 -b 8
+  - title: Write the waveform as JSON, 20 points per second
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/audiowaveform -i input.wav -o input.json --pixels-per-second 20 -b 8
+  - title: Render a waveform image without axis labels
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/audiowaveform -i input.flac -o input.png -z auto -w 1800 -h 280 --no-axis-labels
+  - title: Read an M4A file through FFmpeg (default image)
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/audiowaveform -c 'ffmpeg -loglevel error -i input.m4a -f wav - | audiowaveform --input-format wav --output-format dat -z 256 -b 8 > input.dat'
+combos:
+  - with: [ffmpeg]
+    default: true
+    base: ffmpeg
+    summary: audiowaveform with FFmpeg, for waveforms of AAC, M4A and video files that audiowaveform cannot read.
+    test:
+      - |
+        run() { ffmpeg -hide_banner -loglevel error -y "$@"; }
+        for pair in aac:m4a flac:flac libopus:opus; do
+          run -f lavfi -i sine=frequency=440:sample_rate=48000:duration=2 -c:a "${pair%%:*}" "tone.${pair#*:}"
+        done
+        length() { sed -n 's/.*"length":\([0-9]*\),.*/\1/p' "$1"; }
+        # FFmpeg decodes AAC and writes a WAV stream, which audiowaveform reads
+        # from stdin. Two seconds at 48 kHz are 200 points of 480 samples; the
+        # AAC encoder's delay and padding can add a frame.
+        run -i tone.m4a -f wav - | audiowaveform -q --input-format wav --output-format json -z 480 -b 8 > m4a.json
+        n="$(length m4a.json)"
+        if [ -z "$n" ] || [ "$n" -lt 199 ] || [ "$n" -gt 203 ]; then cat m4a.json >&2; exit 1; fi
+        # libsndfile reads FLAC and Ogg Opus files itself.
+        audiowaveform -q -i tone.flac -o flac.json -z 480 -b 8
+        grep -Fq '"sample_rate":48000,"samples_per_pixel":480,"bits":8,"length":200,' flac.json || { cat flac.json >&2; exit 1; }
+        audiowaveform -q -i tone.opus -o opus.json -z 480 -b 8
+        grep -Fq '"channels":1,"sample_rate":48000,' opus.json || { cat opus.json >&2; exit 1; }
