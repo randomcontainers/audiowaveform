@@ -1,0 +1,127 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+RUN apk add --no-cache \
+      boost-dev \
+      build-base \
+      ca-certificates \
+      cmake \
+      gd-dev \
+      git \
+      gpgv \
+      libid3tag-dev \
+      libmad-dev \
+      libsndfile-dev \
+      scanelf
+
+# audiowaveform publishes no release tarball, and its release tags are
+# lightweight. The release commits are signed by Chris Needham, fingerprint
+# 48A6 2A0D 6B74 FF7C 78EF C8A2 B323 37F0 1336 8EC0. A commit signed by anyone
+# else fails the gpgv check below until their key is added to
+# keys/audiowaveform-release.gpg.
+COPY keys/audiowaveform-release.gpg /tmp/audiowaveform-release.gpg
+ARG VERSION
+ARG SOURCE_COMMIT
+# The tag must point to the commit pinned in package.yml. The clone is retried
+# because Codeberg has short outages. The signature covers the commit object
+# without its gpgsig header, whose continuation lines start with a space; only
+# the headers, up to the first empty line, are searched for it.
+RUN set -eu; \
+    printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    for attempt in 1 2 3; do \
+      git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${VERSION}" \
+        https://codeberg.org/chrisn/audiowaveform.git /src/audiowaveform && break; \
+      rm -rf /src/audiowaveform; \
+      if [ "$attempt" = 3 ]; then echo "cannot clone tag ${VERSION}" >&2; exit 1; fi; \
+      sleep 30; \
+    done; \
+    test "$(git -C /src/audiowaveform rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag ${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }; \
+    git -C /src/audiowaveform cat-file commit HEAD > /tmp/commit; \
+    awk -v asc=/tmp/commit.asc -v payload=/tmp/commit.payload \
+      'b { print > payload; next } /^gpgsig / { s = 1; sub(/^gpgsig /, ""); print > asc; next } s && /^ / { sub(/^ /, ""); print > asc; next } { s = 0; if ($0 == "") b = 1; print > payload }' \
+      /tmp/commit; \
+    gpgv --status-fd 1 --keyring /tmp/audiowaveform-release.gpg /tmp/commit.asc /tmp/commit.payload > /tmp/gpgv-status; \
+    test "$(cat /src/audiowaveform/VERSION)" = "${VERSION}" \
+      || { echo "VERSION in the source is not ${VERSION}" >&2; exit 1; }
+
+ARG JOBS
+# Upstream's unit tests need a googletest checkout in the source tree, and its
+# own packages are built without them. Ubuntu's linker defaults to
+# --as-needed and Alpine's does not; with it, the Boost libraries whose code
+# is only in headers, such as Boost.Regex, are not linked.
+RUN set -eu; \
+    cmake -S /src/audiowaveform -B /tmp/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_EXE_LINKER_FLAGS=-Wl,--as-needed \
+      -DENABLE_TESTS=0; \
+    cmake --build /tmp/build -j"${JOBS:-$(nproc)}"; \
+    DESTDIR=/out cmake --install /tmp/build --strip; \
+    rm -rf /out/usr/local/share/man
+
+ARG BASE_IMAGE
+# The MP3 reader contains code adapted from madlld, and bstdfile.c comes from
+# madlld; each has madlld's BSD license, with its own copyright line, in a
+# header comment.
+# pdjson's public domain dedication is in its UNLICENSE file. runtime-deps lists
+# the so: names audiowaveform needs, plus the packages in runtime-deps.alpine.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    set -eu; \
+    src=/src/audiowaveform; \
+    meta=/out/usr/local/share/randomcontainers/audiowaveform; \
+    mkdir -p "$meta/licenses"; \
+    cp "$src/COPYING" "$meta/licenses/COPYING"; \
+    cp "$src/src/pdjson/UNLICENSE" "$meta/licenses/UNLICENSE.pdjson"; \
+    awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Redistribution and use/) { printf "%s", b; exit } }' \
+      "$src/src/madlld-1.1p1/bstdfile.c" > "$meta/licenses/LICENSE.bstdfile"; \
+    test -s "$meta/licenses/LICENSE.bstdfile"; \
+    sed -n '/code adapted from madlld/,/SUCH DAMAGE/s|^// \{0,1\}||p' \
+      "$src/src/Mp3AudioFileReader.cpp" > "$meta/licenses/LICENSE.madlld"; \
+    grep -q 'Bertrand Petit' "$meta/licenses/LICENSE.madlld"; \
+    grep -q 'SUCH DAMAGE' "$meta/licenses/LICENSE.madlld"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://codeberg.org/chrisn/audiowaveform.git@${SOURCE_COMMIT}" \
+      "https://codeberg.org/chrisn/audiowaveform/src/commit/${SOURCE_COMMIT}" \
+      "https://github.com/randomcontainers/audiowaveform/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    /out/usr/local/bin/audiowaveform --version > /tmp/audiowaveform-version; \
+    grep -Fqx "AudioWaveform v${VERSION}" /tmp/audiowaveform-version \
+      || { cat /tmp/audiowaveform-version >&2; exit 1; }; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(c++ --version | head -n 1)"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      echo "signed by: $(awk '$2 == "VALIDSIG" { print $3 }' /tmp/gpgv-status)"; \
+      cat /tmp/audiowaveform-version; \
+    } > "$meta/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | LC_ALL=C sort -u > /tmp/needed; \
+    for lib in libmad libid3tag libsndfile libgd libboost_program_options libboost_filesystem; do \
+      grep -q "^${lib}\.so\." /tmp/needed || { cat /tmp/needed >&2; echo "audiowaveform does not load ${lib}" >&2; exit 1; }; \
+    done; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/audiowaveform/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "audiowaveform"]
+CMD ["--help"]
